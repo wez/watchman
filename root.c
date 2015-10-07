@@ -106,19 +106,19 @@ static size_t root_init_offset = offsetof(w_root_t, _init_sentinel_);
 static bool w_root_init(w_root_t *root, char **errmsg)
 {
   struct watchman_dir *dir;
-  DIR *osdir = NULL;
+  struct watchman_dir_handle *osdir;
 
   memset((char *)root + root_init_offset, 0,
          sizeof(w_root_t) - root_init_offset);
 
-  osdir = opendir_nofollow(root->root_path->buf);
+  osdir = w_dir_open(root->root_path->buf);
   if (!osdir) {
     ignore_result(asprintf(errmsg, "failed to opendir(%s): %s",
           root->root_path->buf,
           strerror(errno)));
     return false;
   }
-  closedir(osdir);
+  w_dir_close(osdir);
 
   if (!watcher_ops->root_init(watcher, root, errmsg)) {
     return false;
@@ -470,8 +470,7 @@ bool w_root_process_pending(w_root_t *root,
     pending = p->next;
 
     if (!root->cancelled) {
-      w_root_process_path(root, coll, p->path, p->now,
-          p->recursive, p->via_notify);
+      w_root_process_path(root, coll, p->path, p->now, p->flags, NULL);
     }
 
     w_pending_fs_free(p);
@@ -665,7 +664,8 @@ void stop_watching_dir(w_root_t *root, struct watchman_dir *dir)
   watcher_ops->root_stop_watch_dir(watcher, root, dir);
 }
 
-static bool did_file_change(struct stat *saved, struct stat *fresh)
+static bool did_file_change(struct watchman_stat *saved,
+    struct watchman_stat *fresh)
 {
   /* we have to compare this way because the stat structure
    * may contain fields that vary and that don't impact our
@@ -679,27 +679,23 @@ static bool did_file_change(struct stat *saved, struct stat *fresh)
   // Can't compare with memcmp due to padding and garbage in the struct
   // on OpenBSD, which has a 32-bit tv_sec + 64-bit tv_nsec
 #define TIMESPEC_FIELD_CHG(wat) { \
-  struct timespec a = saved->WATCHMAN_ST_TIMESPEC(wat); \
-  struct timespec b = fresh->WATCHMAN_ST_TIMESPEC(wat); \
+  struct timespec a = saved->wat##time; \
+  struct timespec b = fresh->wat##time; \
   if (a.tv_sec != b.tv_sec || a.tv_nsec != b.tv_nsec) { \
     return true; \
   } \
 }
 
-  FIELD_CHG(st_mode);
+  FIELD_CHG(mode);
 
-  if (!S_ISDIR(saved->st_mode)) {
-    FIELD_CHG(st_size);
-    FIELD_CHG(st_nlink);
+  if (!S_ISDIR(saved->mode)) {
+    FIELD_CHG(size);
+    FIELD_CHG(nlink);
   }
-  FIELD_CHG(st_dev);
-  FIELD_CHG(st_ino);
-  FIELD_CHG(st_uid);
-  FIELD_CHG(st_gid);
-  FIELD_CHG(st_rdev);
-  // Don't care about st_atime
-  FIELD_CHG(st_ctime);
-  FIELD_CHG(st_mtime);
+  FIELD_CHG(dev);
+  FIELD_CHG(ino);
+  FIELD_CHG(uid);
+  FIELD_CHG(gid);
   // Don't care about st_blocks
   // Don't care about st_blksize
   // Don't care about st_atimespec
@@ -780,11 +776,29 @@ static w_string_t *w_resolve_filesystem_canonical_name(const char *path)
 #endif
 }
 
+static void struct_stat_to_watchman_stat(const struct stat *st,
+    struct watchman_stat *target) {
+  target->size = st->st_size;
+  target->mode = st->st_mode;
+  target->uid = st->st_uid;
+  target->gid = st->st_gid;
+  target->ino = st->st_ino;
+  target->dev = st->st_dev;
+  target->nlink = st->st_nlink;
+  memcpy(&target->atime, &st->WATCHMAN_ST_TIMESPEC(a),
+      sizeof(target->atime));
+  memcpy(&target->mtime, &st->WATCHMAN_ST_TIMESPEC(m),
+      sizeof(target->mtime));
+  memcpy(&target->ctime, &st->WATCHMAN_ST_TIMESPEC(c),
+      sizeof(target->ctime));
+}
+
 static void stat_path(w_root_t *root,
     struct watchman_pending_collection *coll, w_string_t *full_path,
-    struct timeval now, bool recursive, bool via_notify)
+    struct timeval now, bool recursive, bool via_notify,
+    struct watchman_dir_ent *pre_stat)
 {
-  struct stat st;
+  struct watchman_stat st;
   int res, err;
   char path[WATCHMAN_NAME_MAX];
   struct watchman_dir *dir;
@@ -819,9 +833,19 @@ static void stat_path(w_root_t *root,
     dir_ent = w_ht_val_ptr(w_ht_get(dir->dirs, w_ht_ptr_val(full_path)));
   }
 
-  res = lstat(path, &st);
-  err = res == 0 ? 0 : errno;
-  w_log(W_LOG_DBG, "lstat(%s) file=%p dir=%p\n", path, file, dir_ent);
+  if (pre_stat && pre_stat->has_stat) {
+    memcpy(&st, &pre_stat->stat, sizeof(st));
+    res = 0;
+    err = 0;
+  } else {
+    struct stat struct_stat;
+    res = lstat(path, &struct_stat);
+    err = res == 0 ? 0 : errno;
+    w_log(W_LOG_DBG, "lstat(%s) file=%p dir=%p\n", path, file, dir_ent);
+    if (err == 0) {
+      struct_stat_to_watchman_stat(&struct_stat, &st);
+    }
+  }
 
   if (res && (err == ENOENT || err == ENOTDIR)) {
     /* it's not there, update our state */
@@ -859,7 +883,15 @@ static void stat_path(w_root_t *root,
       w_string_t *lc_file_name;
       struct watchman_file *lc_file = NULL;
 
-      canon_name = w_resolve_filesystem_canonical_name(path);
+      if (pre_stat || !via_notify) {
+        // Optimization: if we're reading the dir, or were passed this path
+        // as part of a recursive walk, then we assume that the name we were
+        // given is already the canonical name
+        canon_name = file_name;
+        w_string_addref(canon_name);
+      } else {
+        canon_name = w_resolve_filesystem_canonical_name(path);
+      }
 
       if (canon_name == NULL) {
         // TOCTOU race: file disappeared (deleted? ran out of memory?) in
@@ -981,20 +1013,22 @@ static void stat_path(w_root_t *root,
        * to crawl it again */
       recursive = true;
     }
-    if (!file->exists || via_notify || did_file_change(&file->st, &st)) {
+    if (!file->exists || via_notify || did_file_change(&file->stat, &st)) {
       w_log(W_LOG_DBG,
           "file changed exists=%d via_notify=%d stat-changed=%d isdir=%d %s\n",
           (int)file->exists,
           (int)via_notify,
           (int)(file->exists && !via_notify),
-          S_ISDIR(st.st_mode),
+          S_ISDIR(st.mode),
           path
       );
       file->exists = true;
       w_root_mark_file_changed(root, file, now);
     }
-    memcpy(&file->st, &st, sizeof(st));
-    if (S_ISDIR(st.st_mode)) {
+
+    memcpy(&file->stat, &st, sizeof(file->stat));
+
+    if (S_ISDIR(st.mode)) {
       if (dir_ent == NULL) {
         recursive = true;
       }
@@ -1007,7 +1041,8 @@ static void stat_path(w_root_t *root,
 
         if (!watcher_ops->flags & WATCHER_HAS_PER_FILE_NOTIFICATIONS) {
           /* we always need to crawl, but may not need to be fully recursive */
-          crawler(root, coll, full_path, now, recursive);
+          w_pending_coll_add(coll, full_path, now,
+              W_PENDING_CRAWL_ONLY | (recursive ? W_PENDING_RECURSIVE : 0));
         } else {
           /* we get told about changes on the child, so we only
            * need to crawl if we've never seen the dir before.
@@ -1015,7 +1050,8 @@ static void stat_path(w_root_t *root,
            * of a dir rename and not a rename event for all of its
            * children. */
           if (recursive) {
-            crawler(root, coll, full_path, now, recursive);
+            w_pending_coll_add(coll, full_path, now,
+                W_PENDING_RECURSIVE|W_PENDING_CRAWL_ONLY);
           }
         }
       }
@@ -1025,10 +1061,10 @@ static void stat_path(w_root_t *root,
       w_root_mark_deleted(root, dir_ent, now, true);
     }
     if ((watcher_ops->flags & WATCHER_HAS_PER_FILE_NOTIFICATIONS) &&
-        !S_ISDIR(st.st_mode) &&
+        !S_ISDIR(st.mode) &&
         !w_string_equal(dir_name, root->root_path)) {
       /* Make sure we update the mtime on the parent directory. */
-      stat_path(root, coll, dir_name, now, false, via_notify);
+      stat_path(root, coll, dir_name, now, false, via_notify, NULL);
     }
   }
 
@@ -1044,7 +1080,8 @@ out:
 
 void w_root_process_path(w_root_t *root,
     struct watchman_pending_collection *coll, w_string_t *full_path,
-    struct timeval now, bool recursive, bool via_notify)
+    struct timeval now, int flags,
+    struct watchman_dir_ent *pre_stat)
 {
   /* From a particular query's point of view, there are four sorts of cookies we
    * can observe:
@@ -1064,7 +1101,7 @@ void w_root_process_path(w_root_t *root,
     struct watchman_query_cookie *cookie;
     bool consider_cookie =
       (watcher_ops->flags & WATCHER_HAS_PER_FILE_NOTIFICATIONS) ?
-      (via_notify || !root->done_initial) : true;
+      ((flags & W_PENDING_VIA_NOTIFY) || !root->done_initial) : true;
 
     if (!consider_cookie) {
       // Never allow cookie files to show up in the tree
@@ -1085,10 +1122,12 @@ void w_root_process_path(w_root_t *root,
     return;
   }
 
-  if (w_string_equal(full_path, root->root_path)) {
-    crawler(root, coll, full_path, now, recursive);
+  if (w_string_equal(full_path, root->root_path)
+      || flags & W_PENDING_CRAWL_ONLY) {
+    crawler(root, coll, full_path, now, flags & W_PENDING_RECURSIVE);
   } else {
-    stat_path(root, coll, full_path, now, recursive, via_notify);
+    stat_path(root, coll, full_path, now, flags & W_PENDING_RECURSIVE,
+        flags & W_PENDING_VIA_NOTIFY, pre_stat);
   }
 }
 
@@ -1117,26 +1156,6 @@ void w_root_mark_deleted(w_root_t *root, struct watchman_dir *dir,
 
     w_root_mark_deleted(root, child, now, true);
   } while (w_ht_next(dir->dirs, &i));
-}
-
-/* Opens a directory making sure it's not a symlink */
-DIR *opendir_nofollow(const char *path)
-{
-#ifdef _WIN32
-  return win_opendir(path, 1 /* no follow */);
-#else
-  int fd = open(path, O_NOFOLLOW | O_CLOEXEC);
-  if (fd == -1) {
-    return NULL;
-  }
-#if defined(__APPLE__)
-  close(fd);
-  return opendir(path);
-#else
-  // errno should be set appropriately if this is not a directory
-  return fdopendir(fd);
-#endif
-#endif
 }
 
 void handle_open_errno(w_root_t *root, struct watchman_dir *dir,
@@ -1233,8 +1252,8 @@ static void crawler(w_root_t *root, struct watchman_pending_collection *coll,
 {
   struct watchman_dir *dir;
   struct watchman_file *file;
-  DIR *osdir;
-  struct dirent *dirent;
+  struct watchman_dir_handle *osdir;
+  struct watchman_dir_ent *dirent;
   w_ht_iter_t i;
   char path[WATCHMAN_NAME_MAX];
   bool stat_all = false;
@@ -1271,7 +1290,7 @@ static void crawler(w_root_t *root, struct watchman_pending_collection *coll,
     uint32_t num_dirs = 0;
 #ifndef _WIN32
     struct stat st;
-    int dfd = dirfd(osdir);
+    int dfd = w_dir_fd(osdir);
     if (dfd != -1 && fstat(dfd, &st) == 0) {
       num_dirs = (uint32_t)st.st_nlink;
     }
@@ -1292,7 +1311,7 @@ static void crawler(w_root_t *root, struct watchman_pending_collection *coll,
     }
   } while (w_ht_next(dir->files, &i));
 
-  while ((dirent = readdir(osdir)) != NULL) {
+  while ((dirent = w_dir_read(osdir)) != NULL) {
     w_string_t *name;
 
     // Don't follow parent/self links
@@ -1314,21 +1333,28 @@ static void crawler(w_root_t *root, struct watchman_pending_collection *coll,
       file->maybe_deleted = false;
     }
     if (!file || !file->exists || stat_all || recursive) {
-      w_pending_coll_add_rel(coll, dir, dirent->d_name,
-          true, now, false);
+      w_string_t *full_path = w_string_path_cat_cstr(dir->path,
+                                dirent->d_name);
+      if (full_path) {
+        w_root_process_path(root, coll, full_path, now,
+            W_PENDING_RECURSIVE, dirent);
+        w_string_delref(full_path);
+      } else {
+        w_log(W_LOG_ERR, "OOM during crawl\n");
+      }
     }
     w_string_delref(name);
   }
-  closedir(osdir);
+  w_dir_close(osdir);
 
   // Anything still in maybe_deleted is actually deleted.
   // Arrange to re-process it shortly
   if (w_ht_first(dir->files, &i)) do {
     file = w_ht_val_ptr(i.value);
     if (file->exists && (file->maybe_deleted ||
-          (S_ISDIR(file->st.st_mode) && recursive))) {
+          (S_ISDIR(file->stat.mode) && recursive))) {
       w_pending_coll_add_rel(coll, dir, file->name->buf,
-          recursive, now, false);
+          now, recursive ? W_PENDING_RECURSIVE : 0);
     }
   } while (w_ht_next(dir->files, &i));
 }
@@ -1805,8 +1831,7 @@ static void io_thread(w_root_t *root)
       }
       w_root_lock(root);
       gettimeofday(&start, NULL);
-      w_pending_coll_add(&root->pending, root->root_path,
-          false, start, false);
+      w_pending_coll_add(&root->pending, root->root_path, start, 0);
       while (w_root_process_pending(root, &pending, true)) {
         ;
       }
@@ -2466,7 +2491,7 @@ w_root_t *w_root_resolve_for_client_mode(const char *filename, char **errmsg)
     gettimeofday(&start, NULL);
     w_root_lock(root);
     w_pending_coll_add(&root->pending, root->root_path,
-        true, start, false);
+        start, W_PENDING_RECURSIVE);
     while (w_root_process_pending(root, &pending, true)) {
       ;
     }

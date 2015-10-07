@@ -249,12 +249,14 @@ struct watchman_clock {
 };
 typedef struct watchman_clock w_clock_t;
 
+#define W_PENDING_RECURSIVE   1
+#define W_PENDING_VIA_NOTIFY 2
+#define W_PENDING_CRAWL_ONLY  4
 struct watchman_pending_fs {
   struct watchman_pending_fs *next;
   w_string_t *path;
-  bool recursive;
   struct timeval now;
-  bool via_notify;
+  int flags;
 };
 
 struct watchman_pending_collection {
@@ -271,10 +273,10 @@ void w_pending_coll_drain(struct watchman_pending_collection *coll);
 void w_pending_coll_lock(struct watchman_pending_collection *coll);
 void w_pending_coll_unlock(struct watchman_pending_collection *coll);
 bool w_pending_coll_add(struct watchman_pending_collection *coll,
-    w_string_t *path, bool recursive, struct timeval now, bool via_notify);
+    w_string_t *path, struct timeval now, int flags);
 bool w_pending_coll_add_rel(struct watchman_pending_collection *coll,
-    struct watchman_dir *dir, const char *name, bool recursive,
-    struct timeval now, bool via_notify);
+    struct watchman_dir *dir, const char *name,
+    struct timeval now, int flags);
 void w_pending_coll_append(struct watchman_pending_collection *target,
     struct watchman_pending_collection *src);
 struct watchman_pending_fs *w_pending_coll_pop(
@@ -339,7 +341,8 @@ struct watchman_ops {
 
   // Initiate an OS-level watch on the provided dir, return a DIR
   // handle, or NULL on error
-  DIR *(*root_start_watch_dir)(watchman_global_watcher_t watcher,
+  struct watchman_dir_handle *(*root_start_watch_dir)(
+      watchman_global_watcher_t watcher,
       w_root_t *root, struct watchman_dir *dir, struct timeval now,
       const char *path);
 
@@ -364,6 +367,31 @@ struct watchman_ops {
   void (*file_free)(watchman_global_watcher_t watcher,
       struct watchman_file *file);
 };
+
+struct watchman_stat {
+  struct timespec atime, mtime, ctime;
+  off_t size;
+  mode_t mode;
+  uid_t uid;
+  gid_t gid;
+  ino_t ino;
+  dev_t dev;
+  nlink_t nlink;
+};
+
+/* opaque (system dependent) type for walking dir contents */
+struct watchman_dir_handle;
+
+struct watchman_dir_ent {
+  bool has_stat;
+  char *d_name;
+  struct watchman_stat stat;
+};
+
+struct watchman_dir_handle *w_dir_open(const char *path);
+struct watchman_dir_ent *w_dir_read(struct watchman_dir_handle *dir);
+void w_dir_close(struct watchman_dir_handle *dir);
+int w_dir_fd(struct watchman_dir_handle *dir);
 
 struct watchman_file {
   /* our name within the parent dir */
@@ -391,7 +419,7 @@ struct watchman_file {
 
   /* cache stat results so we can tell if an entry
    * changed */
-  struct stat st;
+  struct watchman_stat stat;
 };
 
 #define WATCHMAN_COOKIE_PREFIX ".watchman-cookie-"
@@ -642,7 +670,8 @@ struct watchman_dir *w_root_resolve_dir(w_root_t *root,
     w_string_t *dir_name, bool create);
 void w_root_process_path(w_root_t *root,
     struct watchman_pending_collection *coll, w_string_t *full_path,
-    struct timeval now, bool recursive, bool via_notify);
+    struct timeval now, int flags,
+    struct watchman_dir_ent *pre_stat);
 bool w_root_process_pending(w_root_t *root,
     struct watchman_pending_collection *coll,
     bool pull_from_root);

@@ -202,15 +202,16 @@ static void portfs_root_stop_watch_file(watchman_global_watcher_t watcher,
   unused_parameter(file);
 }
 
-static DIR *portfs_root_start_watch_dir(watchman_global_watcher_t watcher,
+static struct watchman_dir_handle *portfs_root_start_watch_dir(
+    watchman_global_watcher_t watcher,
     w_root_t *root, struct watchman_dir *dir, struct timeval now,
     const char *path) {
   struct portfs_root_state *state = root->watch;
-  DIR *osdir;
+  struct watchman_dir_handle *osdir;
   struct stat st;
   unused_parameter(watcher);
 
-  osdir = opendir_nofollow(path);
+  osdir = w_dir_open(path);
   if (!osdir) {
     handle_open_errno(root, dir, now, "opendir", errno, NULL);
     return NULL;
@@ -221,12 +222,12 @@ static DIR *portfs_root_start_watch_dir(watchman_global_watcher_t watcher,
     w_log(W_LOG_ERR, "fstat on opened dir %s failed: %s\n", path,
         strerror(errno));
     w_root_schedule_recrawl(root, "fstat failed");
-    closedir(osdir);
+    w_dir_close(osdir);
     return NULL;
   }
 
   if (!do_watch(state, dir->path, &st)) {
-    closedir(osdir);
+    w_dir_close(osdir);
     return NULL;
   }
 
@@ -290,7 +291,8 @@ static bool portfs_root_consume_notify(watchman_global_watcher_t watcher,
       pthread_mutex_unlock(&state->lock);
       return false;
     }
-    w_pending_coll_add(coll, f->name, true, now, true);
+    w_pending_coll_add(coll, f->name, now,
+        W_PENDING_RECURSIVE|W_PENDING_VIA_NOTIFY);
 
     // It was port_dissociate'd implicitly.  We'll re-establish a
     // watch later when portfs_root_start_watch_(file|dir) are called again
